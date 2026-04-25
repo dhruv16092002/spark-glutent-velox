@@ -1,0 +1,200 @@
+version: '3.8'
+
+services:
+
+  # 🔹 MinIO (S3)
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    command: server /data --console-address ":9001"
+    networks:
+      - spark-net
+    restart: always
+  minio-init:
+    image: minio/mc
+    container_name: minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO...' &&
+      sleep 10 &&
+      mc alias set myminio http://minio:9000 admin password123 &&
+      mc mb -p myminio/warehouse || true &&
+      mc policy set public myminio/warehouse || true &&
+      echo '✅ Warehouse bucket created (if not exists)'
+      "
+    networks:
+      - spark-net
+  # 🔹 Postgres (Hive Metastore DB)
+  postgres:
+    image: postgres:13
+    container_name: hive-db
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: metastore
+    ports:
+      - "5432:5432"
+    networks:
+      - spark-net
+    restart: always
+
+  # 🔹 Hive Metastore
+  hive-metastore:
+    image: apache/hive:3.1.3
+    container_name: hive-metastore
+    depends_on:
+      - postgres
+    ports:
+      - "9083:9083"
+    environment:
+      HIVE_CONF_DIR: /opt/hive/conf
+    volumes:
+      - ./hive-site.xml:/opt/hive/conf/hive-site.xml
+      - ./postgrejar/postgresql-42.7.10.jar:/opt/hive/lib/postgresql.jar
+      - ./hadoopjars:/opt/hive/extra-jars
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      export HADOOP_CLASSPATH=/opt/hive/extra-jars/* &&
+      export HIVE_AUX_JARS_PATH=/opt/hive/extra-jars/* &&
+
+      /opt/hive/bin/schematool -dbType postgres -info || \
+      /opt/hive/bin/schematool -dbType postgres -initSchema --verbose &&
+
+      /opt/hive/bin/hive --service metastore
+      "
+    networks:
+      - spark-net
+    restart: always
+
+  # 🔹 Spark Master
+  # 🔹 Spark Master (Velox Enabled)
+  # 🔹 Spark Master (Stable)
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.gluten
+    container_name: spark-master
+    depends_on:
+      - hive-metastore
+    ports:
+      - "4040:4040"
+      - "8080:8080"
+      - "7077:7077"
+      - "15002:15002"
+    volumes:
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./hive-site.xml:/opt/spark/conf/hive-site.xml
+      - ./drivers:/extra-jars
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    networks:
+      - spark-net
+
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.gluten
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./hive-site.xml:/opt/spark/conf/hive-site.xml
+      - ./drivers:/extra-jars
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    networks:
+      - spark-net
+
+  ranger-db:
+    image: postgres:13
+    container_name: ranger-db
+    environment:
+      POSTGRES_DB: ranger
+      POSTGRES_USER: postgres   # ✅ IMPORTANT
+      POSTGRES_PASSWORD: ranger
+    ports:
+      - "5433:5432"
+    networks:
+      - spark-net
+    restart: always
+
+  ranger-admin:
+    image: apache/ranger:2.4.0
+    container_name: ranger-admin
+    user: root   # ✅ FIX PERMISSION ISSUE
+    depends_on:
+      - ranger-db
+    ports:
+      - "6080:6080"
+    environment:
+      RANGER_DB_TYPE: postgres
+      RANGER_DB_HOST: ranger-db
+      RANGER_DB_NAME: ranger
+
+      # ✅ MUST MATCH postgres container
+      RANGER_DB_USER: postgres
+      RANGER_DB_PASSWORD: ranger
+
+      RANGER_DB_ROOT_USER: postgres
+      RANGER_DB_ROOT_PASSWORD: ranger
+    volumes:
+      - ./ranger-install.properties:/opt/ranger/ranger-2.4.0-admin/install.properties
+      - ./drivers/postgresql.jar:/opt/ranger/postgresql.jar
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      echo '⏳ Waiting for Ranger DB...' &&
+      sleep 20 &&
+
+      cd /opt/ranger/ranger-2.4.0-admin &&
+
+      echo '🚀 Running Ranger setup...' &&
+      ./setup.sh &&
+
+      echo '🚀 Starting Ranger Admin...' &&
+      cd ews && ./start-ranger-admin.sh &&
+
+      tail -f /dev/null
+      "
+    networks:
+      - spark-net
+
+  hive-server:
+    image: apache/hive:3.1.3
+    container_name: hive-server
+    depends_on:
+      - hive-metastore
+      - ranger-admin
+    ports:
+      - "10000:10000"
+    environment:
+      HIVE_CONF_DIR: /opt/hive/conf
+    volumes:
+      - ./hive-site.xml:/opt/hive/conf/hive-site.xml
+      - ./drivers:/opt/hive/extra-jars
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      export HADOOP_CLASSPATH=/opt/hive/extra-jars/* &&
+      export HIVE_AUX_JARS_PATH=/opt/hive/extra-jars/* &&
+
+      /opt/hive/bin/hive --service hiveserver2
+      "
+    networks:
+      - spark-net
+    restart: always
+# 🔥 CRITICAL: NETWORK DEFINITION
+networks:
+  spark-net:
+    driver: bridge
